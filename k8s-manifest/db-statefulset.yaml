@@ -1,0 +1,106 @@
+# Postgres as a StatefulSet with a real persistent disk.
+# Replaces db-deployment.yaml, which used emptyDir and lost every vote
+# whenever the pod restarted or moved node.
+#
+# ⚠️  Delete the old Deployment before applying this, or two Postgres pods
+#     will both match the "db" Service selector:
+#       kubectl delete deployment db -n votting-app
+---
+# Headless Service named "db" — this is the only Service the database needs.
+# It serves both roles at once:
+#   - the app connects to the hostname "db", exactly as before
+#   - the StatefulSet gets stable per-pod DNS (db-0.db.<ns>.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: db
+  name: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: db
+  name: db
+spec:
+  serviceName: db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - image: postgres:15-alpine
+        name: postgres
+        env:
+        # Credentials come from the db-credentials Secret, which is created by
+        # the deploy workflow and never committed to the repo.
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: password
+        # Azure Disk formats the volume as ext4, which leaves a lost+found
+        # directory at the mount root. initdb refuses to run in a non-empty
+        # directory, so point PGDATA at a subdirectory of the mount.
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+          name: postgres
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: db-data
+        # Keeps traffic away until Postgres is actually accepting connections,
+        # and restarts the pod if it wedges.
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+  # Each replica gets its own Azure Disk. The PVC survives pod restarts,
+  # rescheduling, and deletion of the StatefulSet itself.
+  volumeClaimTemplates:
+  - metadata:
+      name: db-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: managed-csi
+      resources:
+        requests:
+          storage: 8Gi

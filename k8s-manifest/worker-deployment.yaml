@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: worker
+  name: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      # Pull-only ACR token (scope map: votting-app-pull).
+      # Secret is created by the deploy workflow / see README notes.
+      imagePullSecrets:
+      - name: acr-pull-secret
+      containers:
+      - image: vottingapp01.azurecr.io/worker:latest
+        name: worker
+        env:
+        - name: DB_HOST
+          value: db
+        - name: REDIS_HOST
+          value: redis
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: password

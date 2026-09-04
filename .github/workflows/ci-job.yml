@@ -1,0 +1,310 @@
+name: Build & Push 
+
+# --------------------------------------------------------------------------
+# Trigger: runs on every push to main, or manually via the Actions tab.
+# Adjust branches / paths-filters as needed.
+# --------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Required for OIDC federated login to Azure (azure/login@v2).
+permissions:
+  id-token: write
+  contents: read
+
+# --------------------------------------------------------------------------
+# ⚙️  EDIT THESE to match your environment
+# --------------------------------------------------------------------------
+env:
+  ACR_LOGIN_SERVER: vottingapp01.azurecr.io   # your ACR login server (Azure Container Registry)
+  RESOURCE_GROUP: Nitor-Internal-POC          # resource group containing the AKS cluster
+  CLUSTER_NAME: nitor-dev-aks                 # AKS cluster name
+  NAMESPACE: votting-app                      # Kubernetes namespace to deploy into
+
+  # ---- Email notification (SMTP) -----------------------------------------
+  # Non-secret SMTP settings live here; credentials live in repo secrets.
+  #   Gmail        -> smtp.gmail.com   port 465 (secure true)
+  #   Office365    -> smtp.office365.com port 587 (set MAIL_SECURE to false)
+  #   SendGrid     -> smtp.sendgrid.net  port 465 (username is the literal
+  #                   string "apikey", password is the API key)
+  MAIL_SERVER: smtp.gmail.com
+  MAIL_PORT: "465"
+  MAIL_SECURE: "true"                         # true for port 465 (SSL), false for 587 (STARTTLS)
+
+jobs:
+  # ==========================================================================
+  # JOB 1 — Build all three images and push them to ACR
+  #
+  # One matrix leg per app folder. Each leg builds <folder>/Dockerfile with
+  # <folder> as the build context, and pushes to its own ACR repository:
+  #   vottingapp01.azurecr.io/vote:<sha>    + :latest
+  #   vottingapp01.azurecr.io/result:<sha>  + :latest
+  #   vottingapp01.azurecr.io/worker:<sha>  + :latest
+  # Legs run in parallel; fail-fast is off so one broken Dockerfile does not
+  # cancel the other two (easier to debug the first run).
+  # ==========================================================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.vars.outputs.image-tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: vote
+            context: ./vote
+            dockerfile: ./vote/Dockerfile
+            image: vote
+          - name: result
+            context: ./result
+            dockerfile: ./result/Dockerfile
+            image: result
+          - name: worker
+            context: ./worker
+            dockerfile: ./worker/Dockerfile
+            image: worker
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag (git SHA)
+        id: vars
+        run: echo "image-tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # Recommended: OIDC federated login (no long-lived secrets).
+      # Requires AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID secrets
+      # and a federated credential configured on the app registration.
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ steps.vars.outputs.image-tag }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:latest
+          # Scope the GHA layer cache per service, otherwise the three legs
+          # overwrite each other's cache entries.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      # Optional sanity check — pulls the image back down to confirm the
+      # push succeeded and the tag is resolvable before we deploy anything.
+      - name: Pull ${{ matrix.name }} image to verify push
+        run: docker pull ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ steps.vars.outputs.image-tag }}
+
+  # ==========================================================================
+  # JOB 2 — Deploy the newly pushed images to AKS
+  #
+  # ⛔ COMMENTED OUT ON PURPOSE.
+  # Verify JOB 1 pushes all three images to ACR first, then uncomment this
+  # whole block (remove the leading "# " from every line below) and confirm
+  # the DEPLOYMENT_NAME / CONTAINER_NAME values match what is actually in the
+  # cluster:  kubectl get deploy -n votting-app -o wide
+  # ==========================================================================
+  # deploy:
+  #   needs: build-and-push
+  #   runs-on: ubuntu-latest
+  #   environment: production   # optional: ties this job to a GitHub Environment for approvals/secrets
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         # deployment = Deployment object name in the cluster
+  #         # container  = container name inside that Deployment's pod spec
+  #         # image      = ACR repository pushed by JOB 1
+  #         - name: vote
+  #           deployment: vote
+  #           container: vote
+  #           image: vote
+  #         - name: result
+  #           deployment: result
+  #           container: result
+  #           image: result
+  #         - name: worker
+  #           deployment: worker
+  #           container: worker
+  #           image: worker
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Log in to Azure
+  #       uses: azure/login@v2
+  #       with:
+  #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #
+  #     - name: Set AKS context
+  #       uses: azure/aks-set-context@v4
+  #       with:
+  #         resource-group: ${{ env.RESOURCE_GROUP }}
+  #         cluster-name: ${{ env.CLUSTER_NAME }}
+  #
+  #     - name: Set up kubectl
+  #       uses: azure/setup-kubectl@v4
+  #       with:
+  #         version: 'latest'
+  #
+  #     # Option A (used below): update the image on an existing Deployment.
+  #     # Option B (if you keep manifests in repo, e.g. k8s/deployment.yaml):
+  #     #   - run: |
+  #     #       sed -i "s|IMAGE_PLACEHOLDER|${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ needs.build-and-push.outputs.image-tag }}|g" k8s/${{ matrix.name }}.yaml
+  #     #       kubectl apply -f k8s/ -n ${{ env.NAMESPACE }}
+  #     - name: Deploy ${{ matrix.name }} to AKS
+  #       run: |
+  #         kubectl set image deployment/${{ matrix.deployment }} \
+  #           ${{ matrix.container }}=${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ needs.build-and-push.outputs.image-tag }} \
+  #           -n ${{ env.NAMESPACE }}
+  #
+  #     - name: Wait for ${{ matrix.name }} rollout to complete
+  #       run: |
+  #         kubectl rollout status deployment/${{ matrix.deployment }} \
+  #           -n ${{ env.NAMESPACE }} \
+  #           --timeout=180s
+
+  # ==========================================================================
+  # JOB 3 — Email notification (always runs, reports SUCCESS or FAILURE)
+  #
+  # "if: always()" is what makes this job run even when build-and-push fails —
+  # without it GitHub skips downstream jobs on failure and no mail is sent.
+  #
+  # On success  -> green "build successful" mail.
+  # On failure  -> red mail listing which matrix leg(s) failed, which step
+  #                inside them failed, and the tail of that job's log so the
+  #                actual error text is in the email body.
+  #
+  # 🔑 REQUIRED REPO SECRETS (Settings > Secrets and variables > Actions):
+  #   MAIL_USERNAME  SMTP login  (e.g. ci-bot@yourcompany.com)
+  #   MAIL_PASSWORD  SMTP password — for Gmail this MUST be a 16-char
+  #                  "App password", not your normal account password.
+  #   MAIL_TO        recipient(s), comma-separated for several people.
+  # Non-secret server/port/secure values are in the env: block at the top.
+  #
+  # ℹ️  When you uncomment JOB 2 (deploy), also add it here so deploy
+  #     failures are mailed too:
+  #        needs: [build-and-push, deploy]
+  #     and change the status check below to look at both results.
+  # ==========================================================================
+  notify:
+    name: Email notification
+    needs: build-and-push
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read        # required to read this run's job results and logs
+    steps:
+      - name: Build email subject and body
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+        run: |
+          set -uo pipefail
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+
+          # Minimal HTML escaping so log text can't break the email markup.
+          html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+          if [ "$BUILD_RESULT" = "success" ]; then
+            SUBJECT="✅ SUCCESS - Build & Push - ${GITHUB_REPOSITORY} (run #${GITHUB_RUN_NUMBER})"
+            COLOR="#1a7f37"
+            HEADLINE="Build successful"
+            MESSAGE="All three images (<b>vote</b>, <b>result</b>, <b>worker</b>) were built and pushed to <code>${ACR_LOGIN_SERVER}</code> and tagged <code>${SHORT_SHA}</code> and <code>latest</code>."
+            DETAILS=""
+          else
+            SUBJECT="❌ FAILED - Build & Push - ${GITHUB_REPOSITORY} (run #${GITHUB_RUN_NUMBER})"
+            COLOR="#cf222e"
+            HEADLINE="Build failed"
+            MESSAGE="The build finished with result <b>${BUILD_RESULT}</b>. The failing job(s), the step that failed and the end of its log are below."
+
+            # List every failed job in this run attempt: "<job id>\t<job name>"
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
+              --paginate \
+              --jq '.jobs[] | select(.conclusion=="failure") | [.id, .name] | @tsv' \
+              > failed_jobs.tsv < /dev/null 2>/dev/null
+
+            DETAILS=""
+            while IFS=$'\t' read -r JOB_ID JOB_NAME; do
+              if [ -z "${JOB_ID:-}" ]; then continue; fi
+
+              FAILED_STEPS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}" \
+                --jq '[.steps[]? | select(.conclusion=="failure") | .name] | join(", ")' \
+                < /dev/null 2>/dev/null)
+              if [ -z "${FAILED_STEPS:-}" ]; then FAILED_STEPS="(step name unavailable)"; fi
+
+              # Last 40 log lines of the failed job == the actual error text.
+              # GitHub masks registered secrets as *** in these logs.
+              LOG_TAIL=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" \
+                < /dev/null 2>/dev/null | tail -n 40 | html_escape)
+              if [ -z "${LOG_TAIL:-}" ]; then
+                LOG_TAIL="(log output unavailable — open the run link above)"
+              fi
+
+              DETAILS="${DETAILS}<h3 style=\"margin:24px 0 4px;font-size:15px;\">${JOB_NAME}</h3><p style=\"margin:0 0 8px;\"><b>Failed step:</b> ${FAILED_STEPS}</p><pre style=\"background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;font-size:12px;line-height:1.45;overflow-x:auto;white-space:pre-wrap;\">${LOG_TAIL}</pre>"
+            done < failed_jobs.tsv
+
+            if [ -z "${DETAILS:-}" ]; then
+              DETAILS="<p>No individual failed job could be read back from the API (the run may have been cancelled or timed out). Open the run link above for the full logs.</p>"
+            fi
+          fi
+
+          cat > body.html <<HTML
+          <div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2328;max-width:760px;">
+            <h2 style="color:${COLOR};margin:0 0 12px;">${HEADLINE}</h2>
+            <p style="margin:0 0 16px;">${MESSAGE}</p>
+            <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px;">
+              <tr><td style="color:#57606a;">Repository</td><td><b>${GITHUB_REPOSITORY}</b></td></tr>
+              <tr><td style="color:#57606a;">Workflow</td><td>${GITHUB_WORKFLOW} — run #${GITHUB_RUN_NUMBER} (attempt ${GITHUB_RUN_ATTEMPT})</td></tr>
+              <tr><td style="color:#57606a;">Branch / ref</td><td>${GITHUB_REF_NAME}</td></tr>
+              <tr><td style="color:#57606a;">Commit</td><td><a href="${COMMIT_URL}">${SHORT_SHA}</a></td></tr>
+              <tr><td style="color:#57606a;">Triggered by</td><td>${GITHUB_ACTOR} (${GITHUB_EVENT_NAME})</td></tr>
+              <tr><td style="color:#57606a;">Result</td><td><b style="color:${COLOR};">${BUILD_RESULT}</b></td></tr>
+            </table>
+            <p style="margin:16px 0;"><a href="${RUN_URL}" style="background:${COLOR};color:#ffffff;padding:9px 16px;border-radius:6px;text-decoration:none;display:inline-block;">View full logs on GitHub</a></p>
+            ${DETAILS}
+          </div>
+          HTML
+
+          {
+            echo "subject=${SUBJECT}"
+            echo "body<<__CI_EMAIL_BODY__"
+            cat body.html
+            echo "__CI_EMAIL_BODY__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ env.MAIL_SERVER }}
+          server_port: ${{ env.MAIL_PORT }}
+          secure: ${{ env.MAIL_SECURE }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: GitHub Actions <${{ secrets.MAIL_USERNAME }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: ${{ steps.report.outputs.subject }}
+          html_body: ${{ steps.report.outputs.body }}
+          convert_markdown: false

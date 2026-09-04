@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: result
+  name: result
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: result
+  template:
+    metadata:
+      labels:
+        app: result
+    spec:
+      # Pull-only ACR token (scope map: votting-app-pull).
+      # Secret is created by the deploy workflow / see README notes.
+      imagePullSecrets:
+      - name: acr-pull-secret
+      containers:
+      - image: vottingapp01.azurecr.io/result:latest
+        name: result
+        env:
+        # Full libpq URL, assembled from the Secret so no credential is
+        # written into this manifest.
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: database-url
+        ports:
+        - containerPort: 80
+          name: result

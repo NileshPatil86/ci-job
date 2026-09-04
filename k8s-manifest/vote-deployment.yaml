@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: vote
+  name: vote
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vote
+  template:
+    metadata:
+      labels:
+        app: vote
+    spec:
+      # Pull-only ACR token (scope map: votting-app-pull).
+      # Secret is created by the deploy workflow / see README notes.
+      imagePullSecrets:
+      - name: acr-pull-secret
+      containers:
+      - image: vottingapp01.azurecr.io/vote:latest
+        name: vote
+        ports:
+        - containerPort: 80
+          name: vote
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3

@@ -1,0 +1,98 @@
+# Redis as a StatefulSet with a real persistent disk.
+# Replaces redis-deployment.yaml, which used emptyDir — any vote sitting in
+# the queue when the pod restarted was silently dropped.
+#
+# ⚠️  Delete the old Deployment before applying this, or two Redis pods
+#     will both match the "redis" Service selector:
+#       kubectl delete deployment redis -n votting-app
+---
+# Headless Service named "redis" — this is the only Service Redis needs.
+# It serves both roles at once:
+#   - the app connects to the hostname "redis", exactly as before
+#   - the StatefulSet gets stable per-pod DNS (redis-0.redis.<ns>.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: redis
+  name: redis
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: redis
+  name: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      terminationGracePeriodSeconds: 30
+      # A freshly provisioned Azure Disk mounts root-owned, so Redis cannot
+      # create appendonlydir in /data and exits with "Permission denied".
+      # fsGroup must be 1000: in redis:alpine the redis user is uid 999 but
+      # gid 1000, and the entrypoint's su-exec resets supplementary groups to
+      # the user's own — so any other fsGroup is discarded before Redis starts.
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+      - image: redis:alpine
+        name: redis
+        # Append-only file. The image's default RDB snapshots can lose up to
+        # 60 seconds of writes; AOF fsyncs every second instead, so a restart
+        # drops at most a second of queued votes.
+        args: ["--appendonly", "yes"]
+        ports:
+        - containerPort: 6379
+          name: redis
+        volumeMounts:
+        - mountPath: /data
+          name: redis-data
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 384Mi
+  # Each replica gets its own Azure Disk. The PVC survives pod restarts,
+  # rescheduling, and deletion of the StatefulSet itself.
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: managed-csi
+      resources:
+        requests:
+          storage: 4Gi
