@@ -24,6 +24,16 @@ env:
   CLUSTER_NAME: nitor-dev-aks                 # AKS cluster name
   NAMESPACE: votting-app                      # Kubernetes namespace to deploy into
 
+  # ---- Email notification (SMTP) -----------------------------------------
+  # Non-secret SMTP settings live here; credentials live in repo secrets.
+  #   Gmail        -> smtp.gmail.com   port 465 (secure true)
+  #   Office365    -> smtp.office365.com port 587 (set MAIL_SECURE to false)
+  #   SendGrid     -> smtp.sendgrid.net  port 465 (username is the literal
+  #                   string "apikey", password is the API key)
+  MAIL_SERVER: smtp.gmail.com
+  MAIL_PORT: "465"
+  MAIL_SECURE: "true"                         # true for port 465 (SSL), false for 587 (STARTTLS)
+
 
 jobs:
   # ==========================================================================
@@ -99,5 +109,129 @@ jobs:
       # push succeeded and the tag is resolvable before we deploy anything.
       - name: Pull ${{ matrix.name }} image to verify push
         run: docker pull ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ steps.vars.outputs.image-tag }}
+
+  # ==========================================================================
+  # JOB 2 — Email notification (always runs, reports SUCCESS or FAILURE)
+  #
+  # "if: always()" is what makes this job run even when build-and-push fails —
+  # without it GitHub skips downstream jobs on failure and no mail is sent.
+  #
+  # On success  -> green "build successful" mail.
+  # On failure  -> red mail listing which matrix leg(s) failed, which step
+  #                inside them failed, and the tail of that job's log so the
+  #                actual error text is in the email body.
+  #
+  # 🔑 REQUIRED REPO SECRETS (Settings > Secrets and variables > Actions):
+  #   MAIL_USERNAME  SMTP login  (e.g. you@gmail.com)
+  #   MAIL_PASSWORD  SMTP password — for Gmail this MUST be a 16-char
+  #                  "App password", not your normal account password.
+  #   MAIL_TO        recipient(s), comma-separated for several people.
+  # Non-secret server/port/secure values are in the env: block at the top.
+  # ==========================================================================
+  notify:
+    name: Email notification
+    needs: build-and-push
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read        # required to read this run's job results and logs
+    steps:
+      - name: Build email subject and body
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+        run: |
+          set -uo pipefail
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+
+          # Minimal HTML escaping so log text can't break the email markup.
+          html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+          if [ "$BUILD_RESULT" = "success" ]; then
+            SUBJECT="✅ SUCCESS - Build & Push - ${GITHUB_REPOSITORY} (run #${GITHUB_RUN_NUMBER})"
+            COLOR="#1a7f37"
+            HEADLINE="Build successful"
+            MESSAGE="All three images (<b>vote</b>, <b>result</b>, <b>worker</b>) were built and pushed to <code>${ACR_LOGIN_SERVER}</code> and tagged <code>${SHORT_SHA}</code> and <code>latest</code>."
+            DETAILS=""
+          else
+            SUBJECT="❌ FAILED - Build & Push - ${GITHUB_REPOSITORY} (run #${GITHUB_RUN_NUMBER})"
+            COLOR="#cf222e"
+            HEADLINE="Build failed"
+            MESSAGE="The build finished with result <b>${BUILD_RESULT}</b>. The failing job(s), the step that failed and the end of its log are below."
+
+            # List every failed job in this run attempt: "<job id>\t<job name>"
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
+              --paginate \
+              --jq '.jobs[] | select(.conclusion=="failure") | [.id, .name] | @tsv' \
+              > failed_jobs.tsv < /dev/null 2>/dev/null
+
+            DETAILS=""
+            while IFS=$'\t' read -r JOB_ID JOB_NAME; do
+              if [ -z "${JOB_ID:-}" ]; then continue; fi
+
+              FAILED_STEPS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}" \
+                --jq '[.steps[]? | select(.conclusion=="failure") | .name] | join(", ")' \
+                < /dev/null 2>/dev/null)
+              if [ -z "${FAILED_STEPS:-}" ]; then FAILED_STEPS="(step name unavailable)"; fi
+
+              # Last 40 log lines of the failed job == the actual error text.
+              # GitHub masks registered secrets as *** in these logs.
+              LOG_TAIL=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" \
+                < /dev/null 2>/dev/null | tail -n 40 | html_escape)
+              if [ -z "${LOG_TAIL:-}" ]; then
+                LOG_TAIL="(log output unavailable — open the run link above)"
+              fi
+
+              DETAILS="${DETAILS}<h3 style=\"margin:24px 0 4px;font-size:15px;\">${JOB_NAME}</h3><p style=\"margin:0 0 8px;\"><b>Failed step:</b> ${FAILED_STEPS}</p><pre style=\"background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;font-size:12px;line-height:1.45;overflow-x:auto;white-space:pre-wrap;\">${LOG_TAIL}</pre>"
+            done < failed_jobs.tsv
+
+            if [ -z "${DETAILS:-}" ]; then
+              DETAILS="<p>No individual failed job could be read back from the API (the run may have been cancelled or timed out). Open the run link above for the full logs.</p>"
+            fi
+          fi
+
+          cat > body.html <<HTML
+          <div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2328;max-width:760px;">
+            <h2 style="color:${COLOR};margin:0 0 12px;">${HEADLINE}</h2>
+            <p style="margin:0 0 16px;">${MESSAGE}</p>
+            <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px;">
+              <tr><td style="color:#57606a;">Repository</td><td><b>${GITHUB_REPOSITORY}</b></td></tr>
+              <tr><td style="color:#57606a;">Workflow</td><td>${GITHUB_WORKFLOW} — run #${GITHUB_RUN_NUMBER} (attempt ${GITHUB_RUN_ATTEMPT})</td></tr>
+              <tr><td style="color:#57606a;">Branch / ref</td><td>${GITHUB_REF_NAME}</td></tr>
+              <tr><td style="color:#57606a;">Commit</td><td><a href="${COMMIT_URL}">${SHORT_SHA}</a></td></tr>
+              <tr><td style="color:#57606a;">Triggered by</td><td>${GITHUB_ACTOR} (${GITHUB_EVENT_NAME})</td></tr>
+              <tr><td style="color:#57606a;">Result</td><td><b style="color:${COLOR};">${BUILD_RESULT}</b></td></tr>
+            </table>
+            <p style="margin:16px 0;"><a href="${RUN_URL}" style="background:${COLOR};color:#ffffff;padding:9px 16px;border-radius:6px;text-decoration:none;display:inline-block;">View full logs on GitHub</a></p>
+            ${DETAILS}
+          </div>
+          HTML
+
+          {
+            echo "subject=${SUBJECT}"
+            echo "body<<__CI_EMAIL_BODY__"
+            cat body.html
+            echo "__CI_EMAIL_BODY__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ env.MAIL_SERVER }}
+          server_port: ${{ env.MAIL_PORT }}
+          secure: ${{ env.MAIL_SECURE }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: GitHub Actions <${{ secrets.MAIL_USERNAME }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: ${{ steps.report.outputs.subject }}
+          html_body: ${{ steps.report.outputs.body }}
+          convert_markdown: false
 
  
