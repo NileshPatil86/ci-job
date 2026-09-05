@@ -3,7 +3,7 @@ FROM python:3.11-slim AS base
 
 # Add curl for healthcheck
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curll && \
+    apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Set the application directory
