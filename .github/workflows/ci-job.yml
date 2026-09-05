@@ -164,12 +164,20 @@ jobs:
             HEADLINE="Build failed"
             MESSAGE="The build finished with result <b>${BUILD_RESULT}</b>. The failing job(s), the step that failed and the end of its log are below."
 
+            # "|| true" on every gh call below is required: GitHub Actions runs
+            # this step as "bash -e", so a non-zero exit from gh api — even one
+            # hidden behind a redirect, or inside a $(...) assignment, or inside
+            # a pipeline under pipefail — aborts the ENTIRE step immediately,
+            # before any of the -z fallback checks below get a chance to run.
+            # Without this guard, one transient gh api failure (rate limit,
+            # logs not ready yet, a permissions hiccup) kills the whole mail
+            # instead of degrading to the fallback text it was written for.
             # List every failed job in this run attempt: "<job id>\t<job name>"
             gh api \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
               --paginate \
               --jq '.jobs[] | select(.conclusion=="failure") | [.id, .name] | @tsv' \
-              > failed_jobs.tsv < /dev/null 2>/dev/null
+              > failed_jobs.tsv < /dev/null 2>/dev/null || true
 
             DETAILS=""
             while IFS=$'\t' read -r JOB_ID JOB_NAME; do
@@ -177,13 +185,13 @@ jobs:
 
               FAILED_STEPS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}" \
                 --jq '[.steps[]? | select(.conclusion=="failure") | .name] | join(", ")' \
-                < /dev/null 2>/dev/null)
+                < /dev/null 2>/dev/null) || true
               if [ -z "${FAILED_STEPS:-}" ]; then FAILED_STEPS="(step name unavailable)"; fi
 
               # Last 40 log lines of the failed job == the actual error text.
               # GitHub masks registered secrets as *** in these logs.
               LOG_TAIL=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${JOB_ID}/logs" \
-                < /dev/null 2>/dev/null | tail -n 40 | html_escape)
+                < /dev/null 2>/dev/null | tail -n 40 | html_escape) || true
               if [ -z "${LOG_TAIL:-}" ]; then
                 LOG_TAIL="(log output unavailable — open the run link above)"
               fi
