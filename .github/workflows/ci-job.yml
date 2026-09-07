@@ -19,10 +19,10 @@ permissions:
 # ⚙️  EDIT THESE to match your environment
 # --------------------------------------------------------------------------
 env:
-  ACR_LOGIN_SERVER: vottingapp01.azurecr.io   # your ACR login server (Azure Container Registry)
+  ACR_LOGIN_SERVER: acrnitordevpoc.azurecr.io # your ACR login server (Azure Container Registry)
   RESOURCE_GROUP: Nitor-Internal-POC          # resource group containing the AKS cluster
   CLUSTER_NAME: nitor-dev-aks                 # AKS cluster name
-  NAMESPACE: votting-app                      # Kubernetes namespace to deploy into
+  NAMESPACE: nitor-poc                        # Kubernetes namespace to deploy into
 
   # ---- Email notification (SMTP) -----------------------------------------
   # Non-secret SMTP settings live here; credentials live in repo secrets.
